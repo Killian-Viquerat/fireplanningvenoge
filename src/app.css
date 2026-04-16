@@ -147,6 +147,30 @@ button {
   @apply text-emerald-700;
 }
 
+.absence-popup {
+  @apply fixed left-3 top-3 z-50 grid max-w-[min(92vw,560px)] gap-1.5 rounded-xl border-l-8 bg-white p-3 shadow-lg;
+}
+
+.absence-popup.warning {
+  @apply border-amber-600 bg-amber-50;
+}
+
+.absence-popup.error {
+  @apply border-red-600 bg-red-50;
+}
+
+.absence-popup-title {
+  @apply text-sm font-bold;
+}
+
+.absence-popup p {
+  @apply m-0 text-sm leading-5 text-slate-700;
+}
+
+.absence-popup-close {
+  @apply mt-1 w-fit border-slate-300 bg-white text-slate-700 hover:border-slate-400 hover:bg-slate-100;
+}
+
 small {
   @apply text-sm text-slate-500;
 }
@@ -396,6 +420,22 @@ main:not(.calendar-page) .list .list-link {
 
 :root[data-theme='dark'] .ok {
   @apply text-emerald-400;
+}
+
+:root[data-theme='dark'] .absence-popup.warning {
+  @apply bg-amber-950/80;
+}
+
+:root[data-theme='dark'] .absence-popup.error {
+  @apply bg-red-950/80;
+}
+
+:root[data-theme='dark'] .absence-popup p {
+  @apply text-slate-100;
+}
+
+:root[data-theme='dark'] .absence-popup-close {
+  @apply border-slate-600 bg-slate-800 text-slate-100 hover:border-slate-400 hover:bg-slate-700;
 }
 
 :root[data-theme='dark'] small {

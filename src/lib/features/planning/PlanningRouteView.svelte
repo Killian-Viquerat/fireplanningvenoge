@@ -126,7 +126,11 @@
     getRoleBadgeText={$viewModel.getRoleBadgeText}
   />
 {:else if page === 'donnees'}
-  <DataPage onExportJson={$viewModel.exportJson} onImportJson={$viewModel.importJson} />
+  <DataPage
+    onExportJson={$viewModel.exportJson}
+    onImportJson={$viewModel.importJson}
+    onResetConfiguration={$viewModel.resetConfiguration}
+  />
 {:else if page === 'calendrier-global'}
   <GlobalCalendarPage
     moveGlobalCalendar={$viewModel.moveGlobalCalendar}

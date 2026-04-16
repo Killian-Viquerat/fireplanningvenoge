@@ -84,6 +84,9 @@
   let suppressNextIndividualSlotClick = false;
   let activePage = 'dashboard';
   let isDarkTheme = false;
+  let sessionCookieReady = false;
+  let absencePopup = null;
+  let absencePopupTimeoutId = null;
   let selectedIndividualFirefighterId = '';
   let selectedEditFirefighter;
   let groupEditNumber = '';
@@ -97,6 +100,8 @@
 
   const formatGroupCode = (numberValue) => `N0${String(numberValue).trim()}`;
   const HALF_HOUR_SLOTS = Array.from({ length: SLOTS_PER_DAY }, (_, index) => index);
+  const SESSION_STATE_COOKIE_KEY = 'fireplanningvenoge-session-state';
+  const SESSION_STATE_COOKIE_MAX_CHARS = 3900;
 
   const nextId = () => {
     if (!globalThis.crypto?.randomUUID) {
@@ -230,6 +235,24 @@
     if (!parsed) return;
     individualCalendarCursor = parsed;
   };
+  const clearAbsencePopupTimer = () => {
+    if (!absencePopupTimeoutId) return;
+    window.clearTimeout(absencePopupTimeoutId);
+    absencePopupTimeoutId = null;
+  };
+  const dismissAbsencePopup = () => {
+    absencePopup = null;
+    clearAbsencePopupTimer();
+  };
+  const showAbsencePopup = ({ severity, title, lines }) => {
+    absencePopup = { severity, title, lines };
+    clearAbsencePopupTimer();
+    if (typeof window === 'undefined') return;
+    absencePopupTimeoutId = window.setTimeout(() => {
+      absencePopup = null;
+      absencePopupTimeoutId = null;
+    }, 9000);
+  };
 
   const applyTheme = (darkMode) => {
     isDarkTheme = darkMode;
@@ -265,6 +288,34 @@
     activeDutyWeekIds = [];
     dutyWeek = { id: '', start: '', end: '' };
     absences = [];
+  };
+
+  const resetConfiguration = () => {
+    groupNumber = '';
+    group = null;
+    firefighters = [];
+    groupMemberIds = [];
+    absences = [];
+    activeDutyWeeks = [];
+    activeWeekAbsences = [];
+    firefighterForm = { nom: '', prenom: '', grade: '', fonctions: [] };
+    absenceForm = { firefighterId: '', start: '', end: '' };
+    dutyWeek = { id: '', start: '', end: '' };
+    dutyWeeks = [];
+    selectedDutyWeekId = '';
+    activeDutyWeekIds = [];
+    globalCalendarView = 'day';
+    globalCalendarCursor = new Date();
+    individualCalendarCursor = new Date();
+    selectedIndividualFirefighterId = '';
+    selectedEditFirefighter = undefined;
+    selectedEditFirefighterId = '';
+    firefighterEditForm = { nom: '', prenom: '', grade: '', fonctions: [] };
+    groupEditNumber = '';
+    clearIndividualSelection();
+    suppressNextIndividualSlotClick = false;
+    dismissAbsencePopup();
+    clearSessionStateCookie();
   };
 
   const updateGroupNumber = (value) => {
@@ -433,12 +484,105 @@
     setCalendarCursorsFromWeek(fallbackWeek);
   };
 
+  const getSlotConstraintAlert = (slot, allAbsences) => {
+    const requirements = slot.type === 'weekend' ? WEEKEND_REQUIREMENTS : WEEKDAY_REQUIREMENTS;
+    const requiredTotal = Object.values(requirements).reduce((sum, count) => sum + count, 0);
+    const slotStartTs = toTs(slot.start);
+    const slotEndTs = toTs(slot.end);
+
+    const availableMembers = groupMembers.filter((member) => {
+      return !allAbsences.some((absence) => {
+        if (absence.firefighterId !== member.id) return false;
+        return overlaps(toTs(absence.start), toTs(absence.end), slotStartTs, slotEndTs);
+      });
+    });
+
+    const perRoleCoverage = Object.entries(requirements).map(([role, count]) => ({
+      role,
+      expected: count,
+      available: availableMembers.filter((member) => member.fonctions.includes(role)).length
+    }));
+    const missingRoleItems = perRoleCoverage.filter((entry) => entry.available < entry.expected);
+    const assignmentPossible = availableMembers.length >= requiredTotal && roleAssignmentPossible(availableMembers, requirements);
+    const hasError = missingRoleItems.length > 0 || !assignmentPossible;
+    const isMinimumCoverage =
+      !hasError && (availableMembers.length === requiredTotal || perRoleCoverage.some((entry) => entry.available === entry.expected));
+
+    if (!hasError && !isMinimumCoverage) return null;
+
+    if (hasError) {
+      const details = [];
+      if (missingRoleItems.length > 0) {
+        details.push(missingRoleItems.map((item) => `${getRoleBadgeText(item.role)} ${item.available}/${item.expected}`).join(', '));
+      }
+      if (!assignmentPossible) {
+        details.push('Affectation impossible avec les fonctions disponibles');
+      }
+      return {
+        severity: 'error',
+        detail: details.join(' | ')
+      };
+    }
+
+    return {
+      severity: 'warning',
+      detail: 'Contraintes respectées au minimum'
+    };
+  };
+
+  const notifyAbsenceConstraintAlert = (createdAbsence, allAbsences) => {
+    if (typeof window === 'undefined') return;
+
+    const relatedWeek = dutyWeeks.find((week) => week.id === createdAbsence.weekId);
+    if (!relatedWeek || !isValidDateRange(relatedWeek.start, relatedWeek.end)) return;
+
+    const absenceStartTs = toTs(createdAbsence.start);
+    const absenceEndTs = toTs(createdAbsence.end);
+    const slotAlerts = getShiftSlots(relatedWeek.start, relatedWeek.end)
+      .filter((slot) => overlaps(absenceStartTs, absenceEndTs, toTs(slot.start), toTs(slot.end)))
+      .map((slot) => {
+        const alert = getSlotConstraintAlert(slot, allAbsences);
+        if (!alert) return null;
+        return {
+          ...alert,
+          slotLabel: slot.label,
+          period: `${new Date(slot.start).toLocaleString('fr-CH')} - ${new Date(slot.end).toLocaleString('fr-CH')}`
+        };
+      })
+      .filter(Boolean);
+
+    if (slotAlerts.length === 0) return;
+
+    const MAX_LINES = 4;
+    const lines = slotAlerts.slice(0, MAX_LINES).map((alert) => `${alert.slotLabel} (${alert.period}): ${alert.detail}`);
+    if (slotAlerts.length > MAX_LINES) {
+      lines.push(`...et ${slotAlerts.length - MAX_LINES} autre(s) créneau(x).`);
+    }
+
+    const hasError = slotAlerts.some((alert) => alert.severity === 'error');
+    const title = hasError
+      ? "Alerte critique: cette absence provoque un défaut de fonctions."
+      : "Attention: cette absence laisse les fonctions au minimum.";
+    showAbsencePopup({
+      severity: hasError ? 'error' : 'warning',
+      title,
+      lines
+    });
+  };
+
+  const appendAbsence = (absenceData) => {
+    const createdAbsence = { id: nextId(), ...absenceData };
+    const nextAbsences = [...absences, createdAbsence];
+    absences = nextAbsences;
+    notifyAbsenceConstraintAlert(createdAbsence, nextAbsences);
+  };
+
   const addAbsence = () => {
     if (!absenceForm.firefighterId) return;
     if (!isValidDateRange(absenceForm.start, absenceForm.end)) return;
     if (!selectedDutyWeekId || !isValidDateRange(dutyWeek.start, dutyWeek.end)) return;
     if (!overlaps(toTs(absenceForm.start), toTs(absenceForm.end), toTs(dutyWeek.start), toTs(dutyWeek.end))) return;
-    absences = [...absences, { id: nextId(), weekId: selectedDutyWeekId, ...absenceForm }];
+    appendAbsence({ weekId: selectedDutyWeekId, ...absenceForm });
     absenceForm = { firefighterId: '', start: '', end: '' };
   };
   const updateAbsenceField = (field, value) => {
@@ -464,16 +608,12 @@
       return;
     }
 
-    absences = [
-      ...absences,
-      {
-        id: nextId(),
-        weekId: selectedDutyWeekId,
-        firefighterId: firefighterId,
-        start,
-        end
-      }
-    ];
+    appendAbsence({
+      weekId: selectedDutyWeekId,
+      firefighterId,
+      start,
+      end
+    });
   };
 
   const exportJson = () => {
@@ -496,13 +636,7 @@
     URL.revokeObjectURL(url);
   };
 
-  const importJson = async (event) => {
-    const [file] = event.target.files || [];
-    if (!file) return;
-
-    const content = await file.text();
-    const data = JSON.parse(content);
-
+  const applyImportedData = (data) => {
     group = data.group || null;
     firefighters = Array.isArray(data.firefighters)
       ? data.firefighters.map((firefighter) => ({
@@ -535,8 +669,7 @@
     }
     const weekIdSet = new Set(dutyWeeks.map((week) => week.id));
     const requestedWeekId = String(data?.selectedDutyWeekId ?? '');
-    selectedDutyWeekId =
-      requestedWeekId && weekIdSet.has(requestedWeekId) ? requestedWeekId : (dutyWeeks[0]?.id ?? '');
+    selectedDutyWeekId = requestedWeekId && weekIdSet.has(requestedWeekId) ? requestedWeekId : (dutyWeeks[0]?.id ?? '');
     const requestedActiveIds = Array.isArray(data?.activeDutyWeekIds)
       ? data.activeDutyWeekIds.map((id) => String(id)).filter((id) => weekIdSet.has(id))
       : [];
@@ -560,7 +693,80 @@
     if (selectedWeek) {
       setCalendarCursorsFromWeek(selectedWeek);
     }
-    event.target.value = '';
+  };
+
+  const getSessionCookieValue = (cookieKey) => {
+    const encodedPrefix = `${encodeURIComponent(cookieKey)}=`;
+    return (
+      document.cookie
+        .split('; ')
+        .find((entry) => entry.startsWith(encodedPrefix))
+        ?.slice(encodedPrefix.length) ?? ''
+    );
+  };
+
+  const persistSessionStateToCookie = () => {
+    if (typeof document === 'undefined' || !sessionCookieReady) return;
+    const payload = JSON.stringify({
+      group,
+      firefighters,
+      groupMemberIds,
+      dutyWeek,
+      dutyWeeks,
+      selectedDutyWeekId,
+      activeDutyWeekIds,
+      absences
+    });
+    const encodedPayload = encodeURIComponent(payload);
+    if (encodedPayload.length > SESSION_STATE_COOKIE_MAX_CHARS) {
+      console.error(
+        "Impossible d'enregistrer la session dans le cookie: la taille des données dépasse la limite d'un cookie de session."
+      );
+      return;
+    }
+    document.cookie = `${encodeURIComponent(SESSION_STATE_COOKIE_KEY)}=${encodedPayload}; path=/; SameSite=Lax`;
+  };
+
+  const restoreSessionStateFromCookie = () => {
+    if (typeof document === 'undefined') return;
+    const encodedState = getSessionCookieValue(SESSION_STATE_COOKIE_KEY);
+    if (!encodedState) return;
+
+    let decodedState = '';
+    try {
+      decodedState = decodeURIComponent(encodedState);
+    } catch (error) {
+      console.error('Cookie de session invalide (encodage).', error);
+      return;
+    }
+
+    let parsedState = null;
+    try {
+      parsedState = JSON.parse(decodedState);
+    } catch (error) {
+      console.error('Cookie de session invalide (JSON).', error);
+      return;
+    }
+
+    applyImportedData(parsedState);
+  };
+
+  const clearSessionStateCookie = () => {
+    if (typeof document === 'undefined') return;
+    document.cookie = `${encodeURIComponent(SESSION_STATE_COOKIE_KEY)}=; path=/; Max-Age=0; SameSite=Lax`;
+  };
+
+  const importJson = async (event) => {
+    const [file] = event.target.files || [];
+    if (!file) return;
+    try {
+      const content = await file.text();
+      const data = JSON.parse(content);
+      applyImportedData(data);
+      persistSessionStateToCookie();
+    } finally {
+      event.target.value = '';
+    }
   };
 
   const updateGroupAssignment = (firefighterId, checked) => {
@@ -859,6 +1065,9 @@
   };
 
   onMount(() => {
+    restoreSessionStateFromCookie();
+    sessionCookieReady = true;
+
     const syncPageFromRouter = () => {
       activePage = getPageFromRoute(router.location);
     };
@@ -908,10 +1117,22 @@
       window.removeEventListener('pointerup', handleWindowMouseUp);
       window.removeEventListener('pointermove', handleWindowPointerMove);
       window.removeEventListener('hashchange', syncPageFromRouter);
+      clearAbsencePopupTimer();
     };
   });
 
   $: globalRange = (globalCalendarCursor, globalCalendarView, getGlobalCalendarRange());
+  $: {
+    group;
+    firefighters;
+    groupMemberIds;
+    dutyWeek;
+    dutyWeeks;
+    selectedDutyWeekId;
+    activeDutyWeekIds;
+    absences;
+    persistSessionStateToCookie();
+  }
   $: individualRange = (individualCalendarCursor, getIndividualCalendarRange());
   $: globalCalendarDays = Array.from({ length: globalRange.dayCount }, (_, index) => addDays(globalRange.start, index));
   $: globalCalendarSegments = buildCalendarSegments(calendarEvents, globalRange.start, globalRange.dayCount);
@@ -1015,6 +1236,7 @@
     constraintAlerts,
     exportJson,
     importJson,
+    resetConfiguration,
     moveGlobalCalendar,
     globalCalendarView,
     setGlobalCalendarView,
@@ -1047,6 +1269,16 @@
 </script>
 
 <main class:calendar-page={activePage === 'calendrier-global' || activePage === 'calendrier-individuel'}>
+  {#if absencePopup}
+    <aside class={`absence-popup ${absencePopup.severity}`} role="alert" aria-live="assertive">
+      <strong class="absence-popup-title">{absencePopup.title}</strong>
+      {#each absencePopup.lines as line}
+        <p>{line}</p>
+      {/each}
+      <button type="button" class="absence-popup-close" on:click={dismissAbsencePopup}>Fermer</button>
+    </aside>
+  {/if}
+
   <h1>Planification de piquet pompier</h1>
 
   <TopNav
